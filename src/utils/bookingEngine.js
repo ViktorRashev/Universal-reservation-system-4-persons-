@@ -1,213 +1,304 @@
-import React, { createContext, useContext, useState, useMemo, useCallback, useEffect } from 'react';
-import { BUSINESS_CONFIGS } from '../data/businessConfigs';
-import { getRelativeDateStr } from '../data/mockReservations';
-import {
-  loadReservationsFromStorage,
-  saveReservationsToStorage,
-  resetReservationsToInitial,
-  loadActiveBusinessFromStorage,
-  saveActiveBusinessToStorage
-} from '../utils/storage';
-import {
-  timeToMinutes,
-  buildReservationIndex,
-  generateResourceSlots,
-  validateReservation
-} from '../utils/bookingEngine';
+/**  * Core Algorithmic Booking Engine  * OmniReserve High-Performance Slot & Conflict Resolution Engine /
 
-const BookingContext = createContext(null);
+/*  * Превръща времеви низ 'HH:mm' в брой минути от полунощ за O(1) математически сравнения  * @param {string} timeStr - напр. "14:30"  * @returns {number} минути от началото на денонощието (870) /
+export function timeToMinutes(timeStr) {
+  if (!timeStr) return 0;
+  const [h, m] = timeStr.split(':').map(Number);
+  return h * 60 + m;
+}
 
-export function BookingProvider({ children }) {
-  const [activeBusinessId, setActiveBusinessId] = useState(() => loadActiveBusinessFromStorage('medical'));
-  const [reservations, setReservations] = useState(() => loadReservationsFromStorage());
-  const [selectedDate, setSelectedDate] = useState(() => getRelativeDateStr(0));
-  const [selectedResourceFilter, setSelectedResourceFilter] = useState('ALL');
-  const [selectedTimeFilter, setSelectedTimeFilter] = useState('ALL');
-  const [selectedPartySize, setSelectedPartySize] = useState(1);
-  const [activeView, setActiveView] = useState('booking');
+/*  * Превръща брой минути обратно в четим времеви формат 'HH:mm'  * @param {number} minutes  * @returns {string} /
+export function minutesToTime(minutes) {
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+}
 
-  const [toast, setToast] = useState(null);
+/*  * Бърза проверка за засичане/припокриване на два времеви интервала  * Два полуотворени интервала [startA, endA) и [startB, endB) се припокриват точно тогава,  * когато: startA < endB && endA > startB /
+export function isIntervalOverlapping(startA, endA, startB, endB) {
+  return startA < endB && endA > startB;
+}
 
-  useEffect(() => {
-    saveReservationsToStorage(reservations);
-  }, [reservations]);
+/*  * Изгражда хеш-индексирана карта на активните резервации по дата и ресурс.  * Това трансформира търсенето от O(N) линейно сканиране на всички резервации  * в O(1) хеш достъп до конкретния списък за деня и ресурса.  * @param {Array} reservations  * @returns {Map<string, Array>} /
+export function buildReservationIndex(reservations) {
+  const index = new Map();
 
-  useEffect(() => {
-    saveActiveBusinessToStorage(activeBusinessId);
-  }, [activeBusinessId]);
+  for (let i = 0; i < reservations.length; i++) {
+    const res = reservations[i];
+    if (res.status === 'cancelled') continue; // Игнорираме отменените
 
-  useEffect(() => {
-    if (!toast) return;
-    const timer = setTimeout(() => setToast(null), 4000);
-    return () => clearTimeout(timer);
-  }, [toast]);
+    const key = `${res.date}_${res.resourceId}`;
+    let list = index.get(key);
+    if (!list) {
+      list = [];
+      index.set(key, list);
+    }
+    list.push({
+      ...res,
+      _startMins: timeToMinutes(res.startTime),
+      _endMins: timeToMinutes(res.endTime)
+    });
+  }
 
-  const showToast = useCallback((message, type = 'success') => {
-    setToast({ message, type, id: Date.now() });
-  }, []);
+  return index;
+}
 
-  const [bookingModalState, setBookingModalState] = useState({
-    isOpen: false,
-    mode: 'create',
-    slot: null,
-    resource: null,
-    reservationToEdit: null
+/*  * Генерира пълен набор от времеви слотове за даден ресурс и дата  * с пълна статус информация (AVAILABLE, BOOKED, PARTIAL, BREAK, CLOSED, PAST) /
+export function generateResourceSlots({
+  businessConfig,
+  resource,
+  date,
+  reservationsIndex,
+  isToday = false,
+  currentMinutes = 0
+}) {
+  if (!businessConfig || !resource || !date) return [];
+
+  // 1. Проверка дали ресурсът работи в този ден от седмицата
+  // неделя = 7 в европейския стандарт, или JS Date.getDay(): 0=нд, 1=пн ... 6=сб
+  const targetDate = new Date(date + 'T00:00:00');
+  const jsDay = targetDate.getDay();
+  const dayOfWeek = jsDay === 0 ? 7 : jsDay;
+
+  if (resource.availableDays && !resource.availableDays.includes(dayOfWeek)) {
+    return [{
+      id: `${resource.id}closed`,
+      time: '00:00',
+      endTime: '23:59',
+      status: 'CLOSED',
+      label: 'Почивен ден за специалиста/ресурса'
+    }];
+  }
+
+  const openMins = timeToMinutes(businessConfig.workingHours.open);
+  const closeMins = timeToMinutes(businessConfig.workingHours.close);
+  const slotDuration = businessConfig.slotDurationMinutes || 30;
+
+  // Обедни/технологични почивки, превърнати в минути за бърз анализ
+  const parsedBreaks = (businessConfig.breaks || []).map(b => ({
+    start: timeToMinutes(b.start),
+    end: timeToMinutes(b.end),
+    title: b.title
+  }));
+
+  // Вземаме само резервациите за този ден и ресурс от O(1) индекса
+  const key = `${date}${resource.id}`;
+  const dayReservations = reservationsIndex?.get(key) || [];
+
+  const slots = [];
+
+  for (let start = openMins; start + slotDuration <= closeMins; start += slotDuration) {
+    const end = start + slotDuration;
+    const timeLabel = minutesToTime(start);
+    const endLabel = minutesToTime(end);
+
+    // Проверка дали слотът попада в почивка
+    const breakOverlap = parsedBreaks.find(b => isIntervalOverlapping(start, end, b.start, b.end));
+    if (breakOverlap) {
+      slots.push({
+        id: `${resource.id}_${timeLabel}`,
+        time: timeLabel,
+        endTime: endLabel,
+        status: 'BREAK',
+        label: breakOverlap.title,
+        resourceId: resource.id,
+        occupiedCapacity: 0,
+        maxCapacity: resource.capacity,
+        bookings: []
+      });
+      continue;
+    }
+
+    // Проверка дали слотът е в миналото (ако датата е днешна)
+    const isPast = isToday && start < currentMinutes;
+
+    // Намиране на всички припокриващи се активни резервации за този слот
+    const overlappingBookings = dayReservations.filter(res =>
+      isIntervalOverlapping(start, end, res._startMins, res.endMins)
+    );
+
+    const isShared = Boolean(resource.isSharedPool);
+    let totalBookedParty = 0;
+    for (let i = 0; i < overlappingBookings.length; i++) {
+      totalBookedParty += (overlappingBookings[i].partySize || 1);
+    }
+
+    let status = 'AVAILABLE';
+    if (isPast) {
+      status = 'PAST';
+    } else if (isShared) {
+      if (totalBookedParty >= resource.capacity) {
+        status = 'BOOKED';
+      } else if (totalBookedParty > 0) {
+        status = 'PARTIAL';
+      } else {
+        status = 'AVAILABLE';
+      }
+    } else {
+      // Ексклузивен ресурс (лекар, маса за ресторант)
+      if (overlappingBookings.length > 0) {
+        status = 'BOOKED';
+      } else {
+        status = 'AVAILABLE';
+      }
+    }
+
+    slots.push({
+      id: `${resource.id}${timeLabel}`,
+      time: timeLabel,
+      endTime: endLabel,
+      status,
+      resourceId: resource.id,
+      occupiedCapacity: totalBookedParty,
+      maxCapacity: resource.capacity,
+      remainingCapacity: Math.max(0, resource.capacity - totalBookedParty),
+      bookings: overlappingBookings
+    });
+  }
+
+  return slots;
+}
+
+/*  * Валидира нова или редактирана резервация срещу всякакви конфликти  * Гарантира 100% консистентност без припокривания */
+export function validateReservation({
+  businessConfig,
+  resource,
+  date,
+  startTime,
+  endTime,
+  partySize = 1,
+  reservationsIndex,
+  excludeReservationId = null
+}) {
+  if (!businessConfig || !resource || !date || !startTime || !endTime) {
+    return { valid: false, error: 'Моля, попълнете всички задължителни полета.' };
+  }
+
+  const startMins = timeToMinutes(startTime);
+  const endMins = timeToMinutes(endTime);
+
+  if (startMins >= endMins) {
+    return { valid: false, error: 'Крайният час трябва да бъде след началния час.' };
+  }
+
+  const openMins = timeToMinutes(businessConfig.workingHours.open);
+  const closeMins = timeToMinutes(businessConfig.workingHours.close);
+
+  if (startMins < openMins || endMins > closeMins) {
+    return {
+      valid: false,
+      error: `Избраният интервал е извън работното време (${businessConfig.workingHours.open} - ${businessConfig.workingHours.close}).`
+    };
+  }
+
+  // Проверка за обедни/технологични почивки
+  for (const b of businessConfig.breaks || []) {
+    const bStart = timeToMinutes(b.start);
+    const bEnd = timeToMinutes(b.end);
+    if (isIntervalOverlapping(startMins, endMins, bStart, bEnd)) {
+      return {
+        valid: false,
+        error: `Интервалът засича регламентирана почивка: ${b.title} (${b.start} - ${b.end}).`
+      };
+    }
+  }
+
+  // Проверка за максимален капацитет на ресурса
+  const requestedSize = Number(partySize) || 1;
+  if (requestedSize > resource.capacity) {
+    return {
+      valid: false,
+      error: `Капацитетът на избрания ресурс е ${resource.capacity} места, а заявените са ${requestedSize}.`
+    };
+  }
+
+  // Проверка за конфликт с вече съществуващи активни резервации
+  const key = `${date}_${resource.id}`;
+  const existingBookings = reservationsIndex?.get(key) || [];
+
+  const conflicting = existingBookings.filter(b => {
+    if (excludeReservationId && b.id === excludeReservationId) return false;
+    return isIntervalOverlapping(startMins, endMins, b._startMins, b._endMins);
   });
 
-  const activeBusiness = useMemo(() => {
-    return BUSINESS_CONFIGS[activeBusinessId] || BUSINESS_CONFIGS.medical;
-  }, [activeBusinessId]);
+  const isShared = Boolean(resource.isSharedPool);
 
-  const switchBusiness = useCallback((newBusinessId) => {
-    if (!BUSINESS_CONFIGS[newBusinessId]) return;
-    setActiveBusinessId(newBusinessId);
-    setSelectedResourceFilter('ALL');
-    setSelectedTimeFilter('ALL');
-    setSelectedPartySize(1);
-    showToast(`Превключено към: ${BUSINESS_CONFIGS[newBusinessId].name}`, 'info');
-  }, [showToast]);
-
-  const reservationsIndex = useMemo(() => {
-    return buildReservationIndex(reservations);
-  }, [reservations]);
-
-  const filteredResources = useMemo(() => {
-    if (selectedResourceFilter === 'ALL') {
-      return activeBusiness.resources;
+  if (isShared) {
+    const currentPartyTotal = conflicting.reduce((sum, b) => sum + (b.partySize || 1), 0);
+    if (currentPartyTotal + requestedSize > resource.capacity) {
+      const free = resource.capacity - currentPartyTotal;
+      return {
+        valid: false,
+        error: `Няма достатъчно свободни места в този интервал. Свободни: ${free}, заявени: ${requestedSize}.`
+      };
     }
-    return activeBusiness.resources.filter(r => r.id === selectedResourceFilter);
-  }, [activeBusiness, selectedResourceFilter]);
-
-  const resourcesSlotsMap = useMemo(() => {
-    const todayStr = getRelativeDateStr(0);
-    const isToday = selectedDate === todayStr;
-    const now = new Date();
-    const currentMinutes = now.getHours() * 60 + now.getMinutes();
-
-    const map = {};
-
-    for (const res of filteredResources) {
-      let slots = generateResourceSlots({
-        businessConfig: activeBusiness,
-        resource: res,
-        date: selectedDate,
-        reservationsIndex,
-        isToday,
-        currentMinutes
-      });
-
-      let filteredSlots = slots;
-      if (selectedTimeFilter === 'MORNING') {
-        filteredSlots = slots.filter(s => timeToMinutes(s.time) < 720);
-      } else if (selectedTimeFilter === 'AFTERNOON') {
-        filteredSlots = slots.filter(s => {
-          const m = timeToMinutes(s.time);
-          return m >= 720 && m < 1020;
-        });
-      } else if (selectedTimeFilter === 'EVENING') {
-        filteredSlots = slots.filter(s => timeToMinutes(s.time) >= 1020);
-      }
-
-      map[res.id] = filteredSlots;
+  } else {
+    if (conflicting.length > 0) {
+      const conf = conflicting[0];
+      return {
+        valid: false,
+        error: `Конфликт! Ресурсът вече е зает от ${conf.startTime} до ${conf.endTime} (${conf.customerName}).`
+      };
     }
+  }
 
-    return map;
-  }, [activeBusiness, filteredResources, selectedDate, reservationsIndex, selectedTimeFilter]);
+  return { valid: true, error: null };
+}
 
-  const analytics = useMemo(() => {
-    const businessReservations = reservations.filter(r => r.businessId === activeBusinessId);
-    const dayReservations = businessReservations.filter(r => r.date === selectedDate && r.status !== 'cancelled');
+/**  * Benchmark runner за демонстрация пред комисията  * Изпълнява N проверки за конфликти и пресмята времето в микросекунди */
+export function runAlgorithmBenchmark(iterations = 5000) {
+  const mockIndex = new Map();
+  const sampleBookings = [];
 
-    let totalSlotsCount = 0;
-    let bookedSlotsCount = 0;
-
-    Object.values(resourcesSlotsMap).forEach(slots => {
-      slots.forEach(s => {
-        if (s.status === 'AVAILABLE' || s.status === 'BOOKED' || s.status === 'PARTIAL') {
-          totalSlotsCount++;
-          if (s.status === 'BOOKED' || s.status === 'PARTIAL') {
-            bookedSlotsCount++;
-          }
-        }
-      });
+  for (let i = 0; i < 50; i++) {
+    const s = 540 + (i * 30) % 480;
+    sampleBookings.push({
+      id: `bench_${i}`,
+      startTime: minutesToTime(s),
+      endTime: minutesToTime(s + 30),
+      _startMins: s,
+      _endMins: s + 30,
+      partySize: 1,
+      customerName: `Тест Потребител ${i}`
     });
+  }
+  mockIndex.set('2026-11-20_doc-1', sampleBookings);
 
-    const occupancyRate = totalSlotsCount > 0 ? Math.round((bookedSlotsCount / totalSlotsCount) * 100) : 0;
+  const testConfig = {
+    workingHours: { open: '08:00', close: '20:00' },
+    breaks: [{ start: '13:00', end: '14:00', title: 'Обяд' }],
+    slotDurationMinutes: 30
+  };
+  const testResource = { id: 'doc-1', capacity: 1, isSharedPool: false };
 
-    const hourHistogram = {};
-    dayReservations.forEach(r => {
-      const h = r.startTime.split(':')[0] + ':00';
-      hourHistogram[h] = (hourHistogram[h] || 0) + 1;
+  const startStamp = performance.now();
+
+  let passed = 0;
+  for (let i = 0; i < iterations; i++) {
+    const testStart = minutesToTime(540 + (i % 600));
+    const testEnd = minutesToTime(540 + (i % 600) + 30);
+    const res = validateReservation({
+      businessConfig: testConfig,
+      resource: testResource,
+      date: '2026-11-20',
+      startTime: testStart,
+      endTime: testEnd,
+      partySize: 1,
+      reservationsIndex: mockIndex
     });
+    if (res.valid) passed++;
+  }
 
-    return {
-      totalBusinessReservations: businessReservations.length,
-      dayActiveReservations: dayReservations.length,
-      occupancyRate,
-      totalSlotsCount,
-      bookedSlotsCount,
-      hourHistogram
-    };
-  }, [reservations, activeBusinessId, selectedDate, resourcesSlotsMap]);
+  const endStamp = performance.now();
+  const totalMs = endStamp - startStamp;
+  const avgMicrosec = (totalMs / iterations) * 1000;
+  const opsPerSec = Math.round((iterations / totalMs) * 1000);
 
-  const openCreateBooking = useCallback((slot, resource) => {
-    setBookingModalState({
-      isOpen: true,
-      mode: 'create',
-      slot,
-      resource,
-      reservationToEdit: null
-    });
-  }, []);
-
-  const openEditBooking = useCallback((reservation) => {
-    const resource = activeBusiness.resources.find(r => r.id === reservation.resourceId);
-    setBookingModalState({
-      isOpen: true,
-      mode: 'edit',
-      slot: {
-        time: reservation.startTime,
-        endTime: reservation.endTime
-      },
-      resource,
-      reservationToEdit: reservation
-    });
-  }, [activeBusiness]);
-
-  const closeBookingModal = useCallback(() => {
-    setBookingModalState(prev => ({ ...prev, isOpen: false }));
-  }, []);
-
-  const addReservation = useCallback((formData) => {
-    const resource = activeBusiness.resources.find(r => r.id === formData.resourceId);
-
-    const validation = validateReservation({
-      businessConfig: activeBusiness,
-      resource,
-      date: formData.date,
-      startTime: formData.startTime,
-      endTime: formData.endTime,
-      partySize: formData.partySize,
-      reservationsIndex
-    });
-
-    if (!validation.valid) {
-      showToast(validation.error, 'error');
-      return { success: false, error: validation.error };
-    }
-
-    const newRes = {
-      id: `res-${activeBusinessId}-${Date.now().toString(36)}`,
-      businessId: activeBusinessId,
-      resourceId: formData.resourceId,
-      date: formData.date,
-      startTime: formData.startTime,
-      endTime: formData.endTime,
-      partySize: Number(formData.partySize) || 1,
-      customerName: formData.customerName.trim(),
-      customerPhone: formData.customerPhone.trim(),
-      customerEmail: formData.customerEmail?.trim() || '',
-      serviceId: formData.serviceId || '',
-      serviceName: formData.serviceName || '',
-      notes: formData.notes?.trim() || '',
-
+  return {
+    iterations,
+    totalMs: Number(totalMs.toFixed(2)),
+    avgMicrosec: Number(avgMicrosec.toFixed(2)),
+    opsPerSec: opsPerSec.toLocaleString('bg-BG'),
+    passedCount: passed
+  };
+}
