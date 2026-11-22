@@ -1,210 +1,213 @@
+import React, { createContext, useContext, useState, useMemo, useCallback, useEffect } from 'react';
+import { BUSINESS_CONFIGS } from '../data/businessConfigs';
+import { getRelativeDateStr } from '../data/mockReservations';
+import {
+  loadReservationsFromStorage,
+  saveReservationsToStorage,
+  resetReservationsToInitial,
+  loadActiveBusinessFromStorage,
+  saveActiveBusinessToStorage
+} from '../utils/storage';
+import {
+  timeToMinutes,
+  buildReservationIndex,
+  generateResourceSlots,
+  validateReservation
+} from '../utils/bookingEngine';
 
-/**
- * ReservationSchedule Advanced System
- * Христо - Алгоритмично ядро
- */
+const BookingContext = createContext(null);
 
-// Преобразува час във формат HH:MM в минути
-export function timeToMinutes(time) {
-  if (typeof time === "number") return time;
+export function BookingProvider({ children }) {
+  const [activeBusinessId, setActiveBusinessId] = useState(() => loadActiveBusinessFromStorage('medical'));
+  const [reservations, setReservations] = useState(() => loadReservationsFromStorage());
+  const [selectedDate, setSelectedDate] = useState(() => getRelativeDateStr(0));
+  const [selectedResourceFilter, setSelectedResourceFilter] = useState('ALL');
+  const [selectedTimeFilter, setSelectedTimeFilter] = useState('ALL');
+  const [selectedPartySize, setSelectedPartySize] = useState(1);
+  const [activeView, setActiveView] = useState('booking');
 
-  const [hours, minutes] = time.split(":").map(Number);
+  const [toast, setToast] = useState(null);
 
-  return hours * 60 + minutes;
-}
+  useEffect(() => {
+    saveReservationsToStorage(reservations);
+  }, [reservations]);
 
-// Преобразува минути във формат HH:MM
-export function minutesToTime(minutes) {
-  const hours = Math.floor(minutes / 60);
-  const mins = minutes % 60;
+  useEffect(() => {
+    saveActiveBusinessToStorage(activeBusinessId);
+  }, [activeBusinessId]);
 
-  return `${String(hours).padStart(2, "0")}:${String(mins).padStart(2, "0")}`;
-}
+  useEffect(() => {
+    if (!toast) return;
+    const timer = setTimeout(() => setToast(null), 4000);
+    return () => clearTimeout(timer);
+  }, [toast]);
 
-// Проверява дали два времеви интервала се застъпват
-export function intervalsOverlap(startA, endA, startB, endB) {
-  return startA < endB && startB < endA;
-}
+  const showToast = useCallback((message, type = 'success') => {
+    setToast({ message, type, id: Date.now() });
+  }, []);
 
-// Създава хеш индекс на резервациите
-export function buildReservationIndex(reservations = []) {
-  const index = new Map();
-
-  reservations.forEach((reservation) => {
-    if (reservation.status === "cancelled") return;
-
-    const key = `${reservation.date}::${reservation.resourceId}`;
-
-    if (!index.has(key)) {
-      index.set(key, []);
-    }
-
-    index.get(key).push(reservation);
+  const [bookingModalState, setBookingModalState] = useState({
+    isOpen: false,
+    mode: 'create',
+    slot: null,
+    resource: null,
+    reservationToEdit: null
   });
 
-  return index;
-}
+  const activeBusiness = useMemo(() => {
+    return BUSINESS_CONFIGS[activeBusinessId] || BUSINESS_CONFIGS.medical;
+  }, [activeBusinessId]);
 
-// Проверява дали резервацията е валидна
-export function validateBooking({
-  reservation,
-  reservations = [],
-  index = null,
-  config = {},
-  excludeReservationId = null,
-}) {
-  const start = timeToMinutes(reservation.startTime);
-  const end = timeToMinutes(reservation.endTime);
+  const switchBusiness = useCallback((newBusinessId) => {
+    if (!BUSINESS_CONFIGS[newBusinessId]) return;
+    setActiveBusinessId(newBusinessId);
+    setSelectedResourceFilter('ALL');
+    setSelectedTimeFilter('ALL');
+    setSelectedPartySize(1);
+    showToast(`Превключено към: ${BUSINESS_CONFIGS[newBusinessId].name}`, 'info');
+  }, [showToast]);
 
-  // Проверка на началния и крайния час
-  if (start >= end) {
-    return {
-      valid: false,
-      reason: "Невалиден времеви интервал",
-    };
-  }
+  const reservationsIndex = useMemo(() => {
+    return buildReservationIndex(reservations);
+  }, [reservations]);
 
-  // Проверка на работното време
-  const workingHours = config.workingHours || {
-    start: "09:00",
-    end: "18:00",
-  };
-
-  const workStart = timeToMinutes(workingHours.start);
-  const workEnd = timeToMinutes(workingHours.end);
-
-  if (start < workStart || end > workEnd) {
-    return {
-      valid: false,
-      reason: "Извън работното време",
-    };
-  }
-
-  // Проверка за почивки
-  const breaks = config.breaks || [];
-
-  for (const pause of breaks) {
-    const pauseStart = timeToMinutes(pause.start);
-    const pauseEnd = timeToMinutes(pause.end);
-
-    if (
-      intervalsOverlap(
-        start,
-        end,
-        pauseStart,
-        pauseEnd
-      )
-    ) {
-      return {
-        valid: false,
-        reason: "Резервацията попада в почивка",
-      };
+  const filteredResources = useMemo(() => {
+    if (selectedResourceFilter === 'ALL') {
+      return activeBusiness.resources;
     }
-  }
+    return activeBusiness.resources.filter(r => r.id === selectedResourceFilter);
+  }, [activeBusiness, selectedResourceFilter]);
 
-  // Използваме готов индекс или създаваме нов
-  const reservationIndex =
-    index || buildReservationIndex(reservations);
+  const resourcesSlotsMap = useMemo(() => {
+    const todayStr = getRelativeDateStr(0);
+    const isToday = selectedDate === todayStr;
+    const now = new Date();
+    const currentMinutes = now.getHours() * 60 + now.getMinutes();
 
-  const key = `${reservation.date}::${reservation.resourceId}`;
+    const map = {};
 
-  const existingReservations =
-    reservationIndex.get(key) || [];
+    for (const res of filteredResources) {
+      let slots = generateResourceSlots({
+        businessConfig: activeBusiness,
+        resource: res,
+        date: selectedDate,
+        reservationsIndex,
+        isToday,
+        currentMinutes
+      });
 
-  // Изключваме текущата резервация при редакция
-  const filteredReservations =
-    existingReservations.filter(
-      (item) => item.id !== excludeReservationId
-    );
+      let filteredSlots = slots;
+      if (selectedTimeFilter === 'MORNING') {
+        filteredSlots = slots.filter(s => timeToMinutes(s.time) < 720);
+      } else if (selectedTimeFilter === 'AFTERNOON') {
+        filteredSlots = slots.filter(s => {
+          const m = timeToMinutes(s.time);
+          return m >= 720 && m < 1020;
+        });
+      } else if (selectedTimeFilter === 'EVENING') {
+        filteredSlots = slots.filter(s => timeToMinutes(s.time) >= 1020);
+      }
 
-  // Проверка за конфликт
-  const conflict = filteredReservations.some((item) => {
-    const existingStart = timeToMinutes(item.startTime);
-    const existingEnd = timeToMinutes(item.endTime);
+      map[res.id] = filteredSlots;
+    }
 
-    return intervalsOverlap(
-      start,
-      end,
-      existingStart,
-      existingEnd
-    );
-  });
+    return map;
+  }, [activeBusiness, filteredResources, selectedDate, reservationsIndex, selectedTimeFilter]);
 
-  if (conflict) {
-    return {
-      valid: false,
-      reason: "Този час вече е зает",
-    };
-  }
+  const analytics = useMemo(() => {
+    const businessReservations = reservations.filter(r => r.businessId === activeBusinessId);
+    const dayReservations = businessReservations.filter(r => r.date === selectedDate && r.status !== 'cancelled');
 
-  return {
-    valid: true,
-    reason: null,
-  };
-}
+    let totalSlotsCount = 0;
+    let bookedSlotsCount = 0;
 
-// Генерира времеви слотове
-export function generateTimeSlots(config = {}) {
-  const workingHours = config.workingHours || {
-    start: "09:00",
-    end: "18:00",
-  };
-
-  const start = timeToMinutes(workingHours.start);
-  const end = timeToMinutes(workingHours.end);
-
-  const duration = config.slotDuration || 30;
-
-  const slots = [];
-
-  for (
-    let time = start;
-    time + duration <= end;
-    time += duration
-  ) {
-    slots.push({
-      startTime: minutesToTime(time),
-      endTime: minutesToTime(time + duration),
+    Object.values(resourcesSlotsMap).forEach(slots => {
+      slots.forEach(s => {
+        if (s.status === 'AVAILABLE' || s.status === 'BOOKED' || s.status === 'PARTIAL') {
+          totalSlotsCount++;
+          if (s.status === 'BOOKED' || s.status === 'PARTIAL') {
+            bookedSlotsCount++;
+          }
+        }
+      });
     });
-  }
 
-  return slots;
-}
+    const occupancyRate = totalSlotsCount > 0 ? Math.round((bookedSlotsCount / totalSlotsCount) * 100) : 0;
 
-// Benchmark: 5000 проверки за конфликти
-export function runBookingBenchmark({
-  reservations = [],
-  config = {},
-  iterations = 5000,
-} = {}) {
-  const index = buildReservationIndex(reservations);
+    const hourHistogram = {};
+    dayReservations.forEach(r => {
+      const h = r.startTime.split(':')[0] + ':00';
+      hourHistogram[h] = (hourHistogram[h] || 0) + 1;
+    });
 
-  const startTime = performance.now();
+    return {
+      totalBusinessReservations: businessReservations.length,
+      dayActiveReservations: dayReservations.length,
+      occupancyRate,
+      totalSlotsCount,
+      bookedSlotsCount,
+      hourHistogram
+    };
+  }, [reservations, activeBusinessId, selectedDate, resourcesSlotsMap]);
 
-  for (let i = 0; i < iterations; i++) {
-    validateBooking({
-      reservation: {
-        id: `test-${i}`,
-        date: "2026-01-01",
-        resourceId: "benchmark-resource",
-        startTime: "10:00",
-        endTime: "10:30",
+  const openCreateBooking = useCallback((slot, resource) => {
+    setBookingModalState({
+      isOpen: true,
+      mode: 'create',
+      slot,
+      resource,
+      reservationToEdit: null
+    });
+  }, []);
+
+  const openEditBooking = useCallback((reservation) => {
+    const resource = activeBusiness.resources.find(r => r.id === reservation.resourceId);
+    setBookingModalState({
+      isOpen: true,
+      mode: 'edit',
+      slot: {
+        time: reservation.startTime,
+        endTime: reservation.endTime
       },
-      index,
-      config,
+      resource,
+      reservationToEdit: reservation
     });
-  }
+  }, [activeBusiness]);
 
-  const endTime = performance.now();
+  const closeBookingModal = useCallback(() => {
+    setBookingModalState(prev => ({ ...prev, isOpen: false }));
+  }, []);
 
-  return {
-    iterations,
-    totalMs: Number(
-      (endTime - startTime).toFixed(3)
-    ),
-    averageMs: Number(
-      ((endTime - startTime) / iterations).toFixed(6)
-    ),
-  };
-}
+  const addReservation = useCallback((formData) => {
+    const resource = activeBusiness.resources.find(r => r.id === formData.resourceId);
+
+    const validation = validateReservation({
+      businessConfig: activeBusiness,
+      resource,
+      date: formData.date,
+      startTime: formData.startTime,
+      endTime: formData.endTime,
+      partySize: formData.partySize,
+      reservationsIndex
+    });
+
+    if (!validation.valid) {
+      showToast(validation.error, 'error');
+      return { success: false, error: validation.error };
+    }
+
+    const newRes = {
+      id: `res-${activeBusinessId}-${Date.now().toString(36)}`,
+      businessId: activeBusinessId,
+      resourceId: formData.resourceId,
+      date: formData.date,
+      startTime: formData.startTime,
+      endTime: formData.endTime,
+      partySize: Number(formData.partySize) || 1,
+      customerName: formData.customerName.trim(),
+      customerPhone: formData.customerPhone.trim(),
+      customerEmail: formData.customerEmail?.trim() || '',
+      serviceId: formData.serviceId || '',
+      serviceName: formData.serviceName || '',
+      notes: formData.notes?.trim() || '',
 
