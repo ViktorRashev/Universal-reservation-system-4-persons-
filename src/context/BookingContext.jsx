@@ -295,3 +295,4 @@ export function useBooking() {
   if (!context) throw new Error('useBooking трябва да се използва в BookingProvider.');
   return context;
 }
+
